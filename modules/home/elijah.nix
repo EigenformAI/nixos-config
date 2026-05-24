@@ -9,6 +9,10 @@
 { config, pkgs, lib, ... }:
 
 {
+  imports = [
+    ./nsl2-resume.nix
+  ];
+
   home = {
     username = "elijah";
     homeDirectory = "/home/elijah";

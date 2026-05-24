@@ -17,6 +17,9 @@
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJhFpUfIbtvUjCO15YjsuyN9PjFLgNegURfmGoyJjEOV"
     ];
     initialPassword = "admin";
+    # Lets `systemd --user` (and the nsl2-resume.service unit) start pre-login
+    # so a reboot during a training run is auto-resumed without a desktop session.
+    linger = true;
   };
 
   # ── Jennifer ───────────────────────────────────────────────────────────

@@ -9,10 +9,18 @@
     ../../modules/common
     ../../modules/common/users.nix
     ../../modules/common/remote-access.nix
+    ../../modules/common/telegram-notify.nix
+    ../../modules/common/gpu-watchdog.nix
     ./gpu.nix
     ./gui.nix
     ./power.nix
   ];
+
+  # GPU disconnect stopgap (docs/design/gpu-watchdog-2026-05-24.md).
+  # Remove these two enables once the Tier-1 cable swap restores multi-day MTBF
+  # (see docs/design/gpu1-remediation-2026-05-24.md).
+  services.telegramNotify.enable = true;
+  services.gpuWatchdog.enable = true;
 
   networking.hostName = "limiting-factor";
 
@@ -67,6 +75,7 @@
     gptfdisk
     lshw
     rsync
+    rclone
 
     # Development
     gnumake
