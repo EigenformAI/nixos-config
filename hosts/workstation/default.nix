@@ -2,7 +2,29 @@
 # GNOME desktop + Pop Shell tiling, 2x RTX 4090, CUDA, Docker + GPU passthrough.
 # Use: nixos-rebuild switch --flake .#limiting-factor
 { config, pkgs, lib, ... }:
-
+let
+  # PiKVM cold-cycle arm hook for the GPU watchdog (services.gpuWatchdog.
+  # coldCycle.method = "external"). On a GPU1 drop in cold-cycle mode the
+  # watchdog runs this BEFORE powering off: it SSHes to the PiKVM (kipperpikvm
+  # on the tailnet) and runs /root/gpu-watchdog-arm.sh, which pre-flights KVMD
+  # and schedules a revive job that presses ATX power once the box reaches S5.
+  # Exit 0 (PIKVM_ARMED) ⇒ safe to power off; nonzero ⇒ the watchdog holds
+  # (onArmFailure) rather than stranding the box. The SSH key + known_hosts live
+  # under /var/lib/gpu-watchdog (root-only, outside the nix store). Setup and
+  # validation steps: docs/design/gpu1-auto-recovery-2026-06-11.md.
+  pikvmColdCycleArm = pkgs.writeShellScript "pikvm-coldcycle-arm" ''
+    set -u
+    export PATH=${lib.makeBinPath [ pkgs.openssh pkgs.coreutils pkgs.gnugrep ]}
+    KEY=/var/lib/gpu-watchdog/pikvm_id_ed25519
+    KH=/var/lib/gpu-watchdog/known_hosts
+    HOST=100.85.243.18
+    out=$(ssh -i "$KEY" -o UserKnownHostsFile="$KH" -o StrictHostKeyChecking=accept-new \
+            -o BatchMode=yes -o ConnectTimeout=8 root@"$HOST" '/root/gpu-watchdog-arm.sh' 2>&1)
+    rc=$?
+    echo "[pikvm-arm] rc=$rc: $out" >&2
+    [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q PIKVM_ARMED
+  '';
+in
 {
   imports = [
     ../../hardware-configuration.nix
@@ -20,7 +42,33 @@
   # Remove these two enables once the Tier-1 cable swap restores multi-day MTBF
   # (see docs/design/gpu1-remediation-2026-05-24.md).
   services.telegramNotify.enable = true;
-  services.gpuWatchdog.enable = true;
+  services.gpuWatchdog = {
+    enable = true;
+    # Path to the nsl2 active-run state file. Surfaces "what run is being
+    # resumed" inside the back-online Telegram message after a watchdog
+    # reboot. Hardcoded to elijah since this is a single-user workstation.
+    resumeStatePath = "/home/elijah/.local/state/nsl2/active-run";
+
+    # Cold-cycle recovery via the PiKVM (replaces the warm reboot that leaves
+    # GPU1 un-enumerated). On a drop the watchdog arms the PiKVM to press ATX
+    # power once the box is in S5, then powers off — a true cold cycle that
+    # re-inits GPU1. Whether it fires automatically is still gated by the mode
+    # file (hold|auto); enable = false reverts to a warm reboot.
+    coldCycle = {
+      enable = true;
+      method = "external";
+      externalArmCommand = "${pikvmColdCycleArm}";
+    };
+
+    # Flip the watchdog's recovery mode from Telegram: /auto /hold /recover
+    # /status (admin), /id (anyone, prints your chat id). The control loop only
+    # writes the mode file — the privileged reboot stays in gpu-watchdog. Both
+    # registered chats are admins.
+    telegramControl = {
+      enable = true;
+      adminChatIds = [ 302828184 448383615 ];
+    };
+  };
 
   networking.hostName = "limiting-factor";
 
@@ -35,6 +83,15 @@
   fileSystems."/" = lib.mkDefault {
     device = "/dev/disk/by-label/nixos";
     fsType = "ext4";
+  };
+
+  # Spare 2T NVMe (label "2T") used for bulk data / archived run snapshots.
+  # `nofail` + a short device timeout so a missing or unhealthy spare disk
+  # never blocks boot (it is non-essential, not on the root path).
+  fileSystems."/mnt/data2t" = {
+    device = "/dev/disk/by-uuid/1d653f23-fd54-4373-904d-72cd34341136";
+    fsType = "ext4";
+    options = [ "nofail" "x-systemd.device-timeout=10s" ];
   };
 
   # Docker with GPU support.

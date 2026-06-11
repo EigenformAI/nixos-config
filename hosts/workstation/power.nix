@@ -51,4 +51,29 @@
     HandleLidSwitchDocked = "ignore";
     HandleLidSwitchExternalPower = "ignore";
   };
+
+  # ── Hardware watchdog (SP5100 TCO) ─────────────────────────────────────────
+  # The AMD chipset TCO watchdog is already loaded (sp5100_tco). We arm only
+  # the *reboot* phase: if a `systemctl reboot` command can't complete its
+  # shutdown sequence within 30s, the chipset forces a hardware-level reset.
+  #
+  # Motivation: the gpu-watchdog stopgap fires `systemctl reboot --force`
+  # when an Xid 79/154 lands. In practice that has sometimes wedged before
+  # power-cycling — leaving us to press the physical reset button. The TCO
+  # watchdog is the only mechanism here that survives a stuck PCIe domain
+  # or a kernel that has lost its grip, because the reset is signalled from
+  # the southbridge, not from the CPU.
+  #
+  # We deliberately do NOT enable `runtimeTime` (heartbeat during normal
+  # operation). It would catch a fully-wedged kernel but adds a periodic
+  # wake; not worth it while Xid events still produce log lines that the
+  # userspace watchdog can act on. If we ever see a wedge that produces
+  # *no* Xid trail, layer it on then.
+  #
+  # 30s is a balance: long enough for systemd to flush filesystems and stop
+  # remaining units after `--force` (which itself only SIGKILLs userspace
+  # — the kernel still does the orderly unmount/remount-ro phase); short
+  # enough that a stuck shutdown doesn't sit indefinitely.
+  # (Renamed from the deprecated `systemd.watchdog.rebootTime` in 26.05.)
+  systemd.settings.Manager.RebootWatchdogSec = "30s";
 }

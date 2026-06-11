@@ -66,16 +66,42 @@
     "nvidia-drm.fbdev=1"
   ];
 
-  # Persistent 350 W power cap on both RTX 4090s.
-  # Mitigates the load-induced Xid 79 "GPU has fallen off the bus" disconnects
-  # documented in docs/design/gpu-disconnect-2026-05-07.md (Phase 4c validated
-  # the cap end-to-end with a full training run). Default per-card limit is
-  # 450 W; capping at 350 W trims the sub-millisecond transient envelope
-  # enough to keep PSU/12VHPWR within regulation. Does NOT address the
-  # idle-disconnect mechanism (suspected GPU1 12VHPWR connector) — that needs
-  # a physical inspection / reseat.
+  # GPU1 di/dt prevention — phase A (docs/design/gpu1-auto-recovery-2026-06-11.md).
+  # Force NVIDIA dynamic power management OFF so the dGPU never drops into the deep
+  # low-power idle state whose load->idle power collapse triggers GPU1's Xid 79.
+  # Rationale: the di/dt clock-lock above pins CLOCKS but not POWER DRAW — at
+  # utilization 0 power still collapses ~350W->idle, so clock-locks cannot stop the
+  # load-stop transient (confirmed 2026-06-11). Disabling dynamic PM keeps the rails
+  # from bottoming out. One reported case had this *consistently* stop the idle
+  # fall-off. Takes effect on the next driver load (the next cold cycle that recovers
+  # GPU1) — it does NOT touch the currently running driver/fleet.
+  # NOTE: GSP-firmware disable (NVreg_EnableGpuFirmware=0), which fixed some other
+  # reports, is INCOMPATIBLE with `open = true` above, so it is deliberately omitted.
+  boot.extraModprobeConfig = ''
+    options nvidia NVreg_DynamicPowerManagement=0x00
+  '';
+
+  # Persistent 350 W power cap on both RTX 4090s, plus a di/dt clock-lock on
+  # GPU1 only.
+  #
+  # 350 W cap (both cards): mitigates the load-induced Xid 79 "GPU has fallen
+  # off the bus" disconnects (docs/design/gpu-disconnect-2026-05-07.md, Phase 4c
+  # validated end-to-end). Default per-card limit is 450 W; 350 W trims the
+  # sub-millisecond transient envelope to keep PSU/12VHPWR within regulation.
+  #
+  # GPU1 clock-lock (2026-06-10): every Xid 79 on this host is GPU1 (0b:00.0),
+  # and the drops cluster around P-state TRANSITIONS — minutes after load stops
+  # (P0->P8 down-transition) or early in a run — not during steady load (matches
+  # Arch BBS 313284 + NVIDIA open-gpu-kernel-modules #900). Pinning GPU1's memory
+  # clock (10501) and raising its graphics-clock floor (1200) keeps it out of the
+  # deep idle state, so it stops making those transitions. Boost ceiling stays at
+  # 3120 and the 350 W cap bounds peak current, so there is no throughput loss —
+  # only ~+30 W idle on GPU1. GPU0 is healthy and left untouched (the control for
+  # the experiment). If this lifts GPU1 MTBF from ~daily to multi-day it is both
+  # diagnosis and mitigation; if not, escalate to the hardware localization
+  # (reseat / de-riser / slot swap).
   systemd.services.nvidia-power-limit = {
-    description = "Apply 350W power cap to NVIDIA GPUs (4090 disconnect mitigation)";
+    description = "350W cap (both) + GPU1 di/dt clock-lock (4090 disconnect mitigation)";
     wantedBy = [ "multi-user.target" ];
     after = [ "systemd-modules-load.service" ];
     unitConfig.ConditionPathExists = "/dev/nvidia0";
@@ -88,6 +114,12 @@
         "$SMI" -pm 1
         "$SMI" -pl 350 -i 0
         "$SMI" -pl 350 -i 1
+        # GPU1 (0000:0B:00.0) di/dt mitigation — pin memory + raise graphics
+        # floor so it stops the idle<->load transitions its Xid 79s cluster
+        # around. `|| true` so a future driver dropping -lmc/-lgc support can't
+        # wedge boot (set -eu is in effect).
+        "$SMI" -i 0000:0B:00.0 -lmc 10501     || true
+        "$SMI" -i 0000:0B:00.0 -lgc 1200,3120 || true
       '';
     };
   };

@@ -7,10 +7,7 @@
   services.xserver.enable = true;
 
   # GNOME desktop environment
-  services.displayManager.gdm = {
-    enable = true;
-    wayland = true;
-  };
+  services.displayManager.gdm.enable = true;
   services.desktopManager.gnome.enable = true;
 
   # Keyboard: remap Caps Lock to Ctrl (matches your other configs)
