@@ -414,6 +414,27 @@ let
   # (empty ⇒ inert). As the always-on getUpdates consumer it also subsumes
   # telegram-notify's chat discovery.
   adminList = lib.concatStringsSep " " (map toString cfg.telegramControl.adminChatIds);
+
+  # Optional /t3pair command: re-mint + DM a fresh `t3 serve` pairing link via
+  # the t3-pair-notify helper (services.t3PairNotify). Restricted to its own
+  # single chatId — tighter than adminChatIds, since a pairing link grants
+  # code-exec on the agent. Launched as a decoupled transient unit so the 30s
+  # re-mint never blocks the getUpdates loop or dies with a control restart.
+  t3PairChat = toString cfg.telegramControl.t3Pair.chatId;
+  t3PairCase = lib.optionalString cfg.telegramControl.t3Pair.enable ''
+    t3pair|pair)
+      if [[ "$chat" == "$T3PAIR_CHAT" ]]; then
+        send "$chat" "🔄 Re-minting your T3 pairing link — it'll arrive here in ~30s (valid ~5 min)."
+        bin=$(command -v t3-pair-notify || true)
+        if [[ -n "$bin" ]]; then
+          systemd-run --quiet --collect "$bin" --force --to "$T3PAIR_CHAT" \
+            || send "$chat" "failed to launch t3-pair-notify"
+        else send "$chat" "t3-pair-notify not installed (enable services.t3PairNotify)"; fi
+      else send "$chat" "not authorized for /t3pair"; fi ;;
+  '';
+  t3PairHelpLine = lib.optionalString cfg.telegramControl.t3Pair.enable
+    "'/t3pair — DM a fresh t3 serve pairing link (you only)' ";
+
   controlScript = pkgs.writeShellScript "gpu-watchdog-telegram-control" ''
     set -uo pipefail
     export PATH=${lib.makeBinPath [ pkgs.curl pkgs.jq pkgs.coreutils pkgs.pciutils pkgs.systemd pkgs.gnugrep ]}:/run/current-system/sw/bin
@@ -424,6 +445,7 @@ let
     RECOVER_FILE=${recoverNowFile}
     CANCEL_FILE=${cancelFile}
     ADMINS="${adminList}"
+    T3PAIR_CHAT="${t3PairChat}"
 
     is_admin() {
       local c="$1" a
@@ -450,7 +472,7 @@ let
       sleep 1
       echo 1 > /sys/bus/pci/rescan 2>/dev/null || true
     }
-    HELP=$(printf '%s\n' 'gpu-watchdog commands:' '/status — mode + GPUs on bus + watchdog state' '/hold — on a drop, wait for you (no reset)' '/auto — on a drop, reset automatically (default)' '/recover — reset a pending drop now (stays in hold)' "/sbr — recover GPU1 via PCIe bus reset, no reboot ('/sbr force' if it is alive)" '/id — show your chat id' '/help — this list' '(all but /id and /help are admin-only)')
+    HELP=$(printf '%s\n' 'gpu-watchdog commands:' '/status — mode + GPUs on bus + watchdog state' '/hold — on a drop, wait for you (no reset)' '/auto — on a drop, reset automatically (default)' '/recover — reset a pending drop now (stays in hold)' "/sbr — recover GPU1 via PCIe bus reset, no reboot ('/sbr force' if it is alive)" '/id — show your chat id' '/help — this list' ${t3PairHelpLine}'(all but /id and /help are admin-only)')
 
     while :; do
       if [[ ! -r "$TOKEN_FILE" ]]; then sleep 30; continue; fi
@@ -512,7 +534,7 @@ let
                     send "$chat" "❌ GPU1 still down after bus reset. A reboot is needed — /recover or /auto with a drop pending."
                   fi
                 fi ;;
-              *) : ;;
+              ${t3PairCase}*) : ;;
             esac
           done
     done
@@ -633,6 +655,24 @@ in
           bearer credential (semi-exposed per the watchdog doc); keep this list
           to your own id and rotate the token if in doubt.
         '';
+      };
+
+      t3Pair = {
+        enable = lib.mkEnableOption ''
+          a /t3pair command that re-mints and DMs a fresh `t3 serve` pairing
+          link (see services.t3PairNotify). Requires services.t3PairNotify to
+          be enabled (it provides the t3-pair-notify helper). Restricted to
+          t3Pair.chatId only — tighter than adminChatIds, since a pairing link
+          grants admin/code-exec on the agent'';
+        chatId = lib.mkOption {
+          type = lib.types.int;
+          default = 0;
+          example = 448383615;
+          description = ''
+            The single chat allowed to run /t3pair and receive the link.
+            Should match services.t3PairNotify.chatId.
+          '';
+        };
       };
     };
   };

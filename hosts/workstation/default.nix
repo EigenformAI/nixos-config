@@ -33,6 +33,7 @@ in
     ../../modules/common/remote-access.nix
     ../../modules/common/telegram-notify.nix
     ../../modules/common/gpu-watchdog.nix
+    ../../modules/common/t3-pair-notify.nix
     ./gpu.nix
     ./gui.nix
     ./power.nix
@@ -67,6 +68,37 @@ in
     telegramControl = {
       enable = true;
       adminChatIds = [ 302828184 448383615 ];
+
+      # /t3pair: re-mint + DM a fresh `t3 serve` pairing link on demand. Locked
+      # to elijah's chat only (NOT the full adminChatIds) — a pairing link is
+      # admin/code-exec on the agent. Provided by services.t3PairNotify below.
+      t3Pair = {
+        enable = true;
+        chatId = 448383615;
+      };
+    };
+  };
+
+  # Deliver `t3 serve` pairing links to Telegram (modules/common/t3-pair-notify.nix).
+  # t3 mints a fresh, single-use, 5-min, admin-scoped pairing token on every
+  # start and only prints it to the console — unusable on a headless box that
+  # reboots for GPU recovery. This reads the token from t3's SQLite and DMs the
+  # TAILNET pairing URL to elijah: once after boot if unpaired (sessions last 30
+  # days, so this is quiet once paired), or on demand via /t3pair (re-minting).
+  # Reachability is still gated by tailscale/LAN; Telegram delivery is the
+  # convenience layer, not the security boundary.
+  services.t3PairNotify = {
+    enable = true;
+    chatId = 448383615;
+    dbPath = "/home/elijah/.t3/userdata/state.sqlite";
+    pairUrl = {
+      scheme = "http";                          # services.t3Serve binds plain HTTP
+      host = "limiting-factor.tail6ee1b.ts.net"; # tailnet FQDN, not the LAN IP
+      port = 3773;
+    };
+    restart = {
+      machine = "elijah@.host";                 # t3-serve is elijah's user unit
+      unit = "t3-serve.service";
     };
   };
 

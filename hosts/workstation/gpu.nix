@@ -84,10 +84,13 @@
   # Persistent 350 W power cap on both RTX 4090s, plus a di/dt clock-lock on
   # GPU1 only.
   #
-  # 350 W cap (both cards): mitigates the load-induced Xid 79 "GPU has fallen
-  # off the bus" disconnects (docs/design/gpu-disconnect-2026-05-07.md, Phase 4c
-  # validated end-to-end). Default per-card limit is 450 W; 350 W trims the
-  # sub-millisecond transient envelope to keep PSU/12VHPWR within regulation.
+  # Power caps: GPU0 stays at 350 W, GPU1 raised to stock 450 W (2026-06-17).
+  # The 350 W cap originally trimmed the sub-millisecond transient envelope to
+  # keep a marginal supply within regulation (docs/design/gpu-disconnect-2026-05-07.md).
+  # v8 localized the disconnect to the FSP+octopus power chain (the fault followed
+  # it to GPU0), exonerating the GPU1 board — so GPU1, now on the modern Seasonic
+  # + native 12VHPWR, no longer needs the trim and runs at stock 450 W. GPU0 stays
+  # capped while it remains on the marginal FSP chain.
   #
   # GPU1 clock-lock (2026-06-10): every Xid 79 on this host is GPU1 (0b:00.0),
   # and the drops cluster around P-state TRANSITIONS — minutes after load stops
@@ -101,7 +104,7 @@
   # diagnosis and mitigation; if not, escalate to the hardware localization
   # (reseat / de-riser / slot swap).
   systemd.services.nvidia-power-limit = {
-    description = "350W cap (both) + GPU1 di/dt clock-lock (4090 disconnect mitigation)";
+    description = "GPU0 350W + GPU1 450W power caps + GPU1 di/dt clock-lock (4090 disconnect mitigation)";
     wantedBy = [ "multi-user.target" ];
     after = [ "systemd-modules-load.service" ];
     unitConfig.ConditionPathExists = "/dev/nvidia0";
@@ -111,9 +114,13 @@
       ExecStart = pkgs.writeShellScript "nvidia-power-limit" ''
         set -eu
         SMI=${config.hardware.nvidia.package.bin}/bin/nvidia-smi
-        "$SMI" -pm 1
-        "$SMI" -pl 350 -i 0
-        "$SMI" -pl 350 -i 1
+        # `|| true` on every line so a single downed/fallen-off GPU (GPU0 is now
+        # the chronic dropper) can't abort the script under `set -eu` and leave
+        # the surviving GPU without its cap/clock-lock. BDFs (not indices) because
+        # nvidia-smi renumbers indices when a GPU is off the bus.
+        "$SMI" -pm 1 || true
+        "$SMI" -pl 350 -i 0000:05:00.0 || true   # GPU0 stays 350W (marginal FSP+octopus chain)
+        "$SMI" -pl 450 -i 0000:0B:00.0 || true   # GPU1 stock 450W (good Seasonic chain, exonerated 2026-06-17)
         # GPU1 (0000:0B:00.0) di/dt mitigation — pin memory + raise graphics
         # floor so it stops the idle<->load transitions its Xid 79s cluster
         # around. `|| true` so a future driver dropping -lmc/-lgc support can't
