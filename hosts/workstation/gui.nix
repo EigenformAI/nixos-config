@@ -81,4 +81,17 @@
 
   # Printing (useful for a shared workstation)
   services.printing.enable = true;
+
+  # cups-browsed has a known runaway-memory bug: on 2026-07-22 it leaked to
+  # 108 GB RSS and starved the box, livelocking a data-gen run for ~16 h
+  # (see NSL2-geology-task docs/design/cups-browsed-ram-leak-supervisor-
+  # livelock-2026-07-22.md). Cgroup-bound it so systemd OOM-kills and
+  # restarts it long before it can pressure the host, while keeping
+  # network-printer discovery working.
+  systemd.services.cups-browsed.serviceConfig = {
+    MemoryHigh = "384M";
+    MemoryMax = "512M";
+    Restart = "on-failure";
+    RestartSec = "30s";
+  };
 }

@@ -30,10 +30,13 @@ in
     ../../hardware-configuration.nix
     ../../modules/common
     ../../modules/common/users.nix
+    ../../modules/common/storage.nix
     ../../modules/common/remote-access.nix
     ../../modules/common/telegram-notify.nix
     ../../modules/common/gpu-watchdog.nix
     ../../modules/common/t3-pair-notify.nix
+    ../../modules/common/docker-network-prune.nix
+    ../../modules/common/disk-space-alert.nix
     ./gpu.nix
     ./gui.nix
     ./power.nix
@@ -43,6 +46,23 @@ in
   # Remove these two enables once the Tier-1 cable swap restores multi-day MTBF
   # (see docs/design/gpu1-remediation-2026-05-24.md).
   services.telegramNotify.enable = true;
+
+  # Backstop for the weval-agents per-slot network leak (2026-07-23 incident:
+  # 6,782 leaked gen_* networks → dbus quota → NetworkManager evicted → box
+  # offline). Deletes only container-less gen_* networks older than 24h;
+  # multi-day training runs are pinned by their containers in any state.
+  services.dockerNetworkPrune.enable = true;
+
+  # Early-warning when a filesystem fills up (Telegram via telegram-notify).
+  # Root sits ~87% full (big ML trees under /home) and runs can spill tens of
+  # GB fast; a full root quietly wedges docker/logind/the watchdog. Edge-
+  # triggered so it warns on crossing 90% and escalations, not every tick.
+  services.diskSpaceAlert = {
+    enable = true;
+    mounts = [ "/" "/mnt/data2t" "/mnt/asis-archive" "/mnt/backup" "/mnt/bulk" ];
+    thresholdPercent = 90;
+  };
+
   services.gpuWatchdog = {
     enable = true;
     # Path to the nsl2 active-run state file. Surfaces "what run is being
@@ -117,14 +137,7 @@ in
     fsType = "ext4";
   };
 
-  # Spare 2T NVMe (label "2T") used for bulk data / archived run snapshots.
-  # `nofail` + a short device timeout so a missing or unhealthy spare disk
-  # never blocks boot (it is non-essential, not on the root path).
-  fileSystems."/mnt/data2t" = {
-    device = "/dev/disk/by-uuid/1d653f23-fd54-4373-904d-72cd34341136";
-    fsType = "ext4";
-    options = [ "nofail" "x-systemd.device-timeout=10s" ];
-  };
+  # Data filesystems + disk-maintenance live in modules/common/storage.nix.
 
   # Docker with GPU support.
   # `cdi-spec-dirs` must include `/var/run/cdi` because the upstream
