@@ -56,11 +56,11 @@ in
   # Early-warning when a filesystem fills up (Telegram via telegram-notify).
   # Root sits ~87% full (big ML trees under /home) and runs can spill tens of
   # GB fast; a full root quietly wedges docker/logind/the watchdog. Edge-
-  # triggered so it warns on crossing 90% and escalations, not every tick.
+  # triggered so it warns on crossing 95% and 99%, not every tick.
   services.diskSpaceAlert = {
     enable = true;
     mounts = [ "/" "/mnt/data2t" "/mnt/asis-archive" "/mnt/backup" "/mnt/bulk" ];
-    thresholdPercent = 90;
+    thresholdsPercent = [ 95 99 ];
   };
 
   services.gpuWatchdog = {
@@ -100,11 +100,10 @@ in
   };
 
   # Deliver `t3 serve` pairing links to Telegram (modules/common/t3-pair-notify.nix).
-  # t3 mints a fresh, single-use, 5-min, admin-scoped pairing token on every
-  # start and only prints it to the console — unusable on a headless box that
-  # reboots for GPU recovery. This reads the token from t3's SQLite and DMs the
-  # TAILNET pairing URL to elijah: once after boot if unpaired (sessions last 30
-  # days, so this is quiet once paired), or on demand via /t3pair (re-minting).
+  # t3 prints a pairing token to the console at startup, which is unusable on a
+  # headless box that reboots for GPU recovery. This mints one on demand and DMs
+  # the TAILNET pairing URL to elijah: once after boot if unpaired (sessions
+  # outlive restarts, so this is quiet once paired), or via /t3pair any time.
   # Reachability is still gated by tailscale/LAN; Telegram delivery is the
   # convenience layer, not the security boundary.
   services.t3PairNotify = {
@@ -116,10 +115,7 @@ in
       host = "limiting-factor.tail6ee1b.ts.net"; # tailnet FQDN, not the LAN IP
       port = 3773;
     };
-    restart = {
-      machine = "elijah@.host";                 # t3-serve is elijah's user unit
-      unit = "t3-serve.service";
-    };
+    user = "elijah";                            # owns the t3 store; mint runs as them
   };
 
   networking.hostName = "limiting-factor";

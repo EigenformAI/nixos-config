@@ -424,7 +424,7 @@ let
   t3PairCase = lib.optionalString cfg.telegramControl.t3Pair.enable ''
     t3pair|pair)
       if [[ "$chat" == "$T3PAIR_CHAT" ]]; then
-        send "$chat" "🔄 Re-minting your T3 pairing link — it'll arrive here in ~30s (valid ~5 min)."
+        send "$chat" "🔄 Minting your T3 pairing link — it'll arrive here shortly (the message states its validity)."
         bin=$(command -v t3-pair-notify || true)
         if [[ -n "$bin" ]]; then
           systemd-run --quiet --collect "$bin" --force --to "$T3PAIR_CHAT" \

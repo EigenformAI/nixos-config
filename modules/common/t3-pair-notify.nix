@@ -1,35 +1,37 @@
 # Deliver the `t3 serve` pairing link to Telegram instead of the console.
 #
-# Background — how t3 pairing actually works (t3 v0.0.27, reverse-engineered):
-#   On every server start `t3 serve` mints a NEW one-time pairing credential
-#   (12 chars from 23456789ABCDEFGHJKLMNPQRSTUVWXYZ), prints it as `Token:` /
-#   `Pairing URL:`, and stores it PLAINTEXT in ~/.t3/userdata/state.sqlite
-#   (auth_pairing_links.credential). It is:
-#     - single-use   (consuming it mints a session; then consumed_at is set)
-#     - short-lived   (TTL hardcoded to 5 min — no flag/env to extend)
-#     - admin-scoped  (subject "administrative-bootstrap"; pairing == code-exec
-#                      as the serving user, so the link is sensitive)
-#   Consuming it yields a 30-DAY session (auth_sessions) that PERSISTS across
-#   server restarts. So you only ever (re)pair when unpaired or after 30 days —
-#   NOT on every reboot. There is no native "fixed code"; web/serve mode only
-#   supports these random one-time tokens.
+# Background — how t3 pairing works (verified against t3 v0.0.33):
+#   A pairing credential is a one-time coupon (12 chars from
+#   23456789ABCDEFGHJKLMNPQRSTUVWXYZ) stored PLAINTEXT in
+#   ~/.t3/userdata/state.sqlite (auth_pairing_links.credential). It is:
+#     - single-use  (redeeming it mints a session; then consumed_at is set)
+#     - time-bound  (TTL is a flag — see `ttl` below; 5 min if unspecified)
+#     - privileged  (scopes cover orchestration:operate and terminal:operate,
+#                    i.e. redeeming it means code execution as the serving user,
+#                    so treat the link like a password)
+#   Redeeming it yields a session that PERSISTS across server restarts, so you
+#   only pair when a device is new or its session was cleared — NOT every boot.
 #
-# This module bridges that gap. A single root helper (`t3-pair-notify`) reads
-# the freshly-minted credential straight from the SQLite DB, rebuilds the URL
-# against the TAILNET hostname (t3's own connection string uses the LAN IP,
-# useless when you're remote), and DMs it to one authorised Telegram chat:
+#   `t3 serve` also prints a fresh credential + QR at startup, but only to the
+#   console, which is useless on a headless box that reboots for GPU recovery.
+#
+# This module bridges that gap. A single root helper (`t3-pair-notify`) mints a
+# link with `t3 auth pairing create` and DMs it to one authorised Telegram chat:
 #   --auto   send ONLY if there is no active session (you actually need to pair)
-#            and not within throttleSeconds of the last send. Never restarts the
-#            server. Used by the boot prompt.
-#   --force  ensure a valid unconsumed link exists (restart t3-serve to re-mint
-#            if the last one is stale/consumed), then send. Used by /t3pair.
+#            and not within throttleSeconds of the last send. Used by the boot
+#            prompt.
+#   --force  always mint a fresh link and send it. Used by /t3pair.
 #
-# It runs as root because root already (a) reads the root-only bot token, (b)
-# reads the user's t3 DB, and (c) can restart the user's `t3-serve` unit — so no
-# home-manager↔system permission coupling is needed. The on-demand `/t3pair`
-# command lives in the gpu-watchdog control loop (the host's single Telegram
-# getUpdates consumer); this module only ever calls sendMessage, so it never
-# competes for updates.
+# `auth pairing create` writes directly to the store and does not need the
+# server to be up, so neither mode has to touch `t3-serve` — an earlier version
+# of this module restarted the unit to force a re-mint, which dropped whatever
+# the agent was doing and could not issue a link while a session was live.
+#
+# The helper runs as root because root already reads the root-only bot token,
+# and it drops to the serving user (via `runuser`) for the mint itself so the
+# sqlite store keeps its ownership. The on-demand `/t3pair` command lives in the
+# gpu-watchdog control loop (the host's single Telegram getUpdates consumer);
+# this module only ever calls sendMessage, so it never competes for updates.
 #
 # Companion: services.gpuWatchdog.telegramControl.t3Pair (gpu-watchdog.nix)
 #            services.t3Serve (modules/home/t3-serve.nix, the home-manager unit)
@@ -39,7 +41,7 @@ let
 
   notifyScript = pkgs.writeShellApplication {
     name = "t3-pair-notify";
-    runtimeInputs = with pkgs; [ curl jq coreutils sqlite systemd ];
+    runtimeInputs = with pkgs; [ curl jq coreutils sqlite util-linux nodejs_24 ];
     text = ''
       TOKEN_FILE=${lib.escapeShellArg cfg.botTokenFile}
       DB=${lib.escapeShellArg cfg.dbPath}
@@ -47,8 +49,12 @@ let
       HOST=${lib.escapeShellArg cfg.pairUrl.host}
       PORT=${toString cfg.pairUrl.port}
       DEFAULT_CHAT=${toString cfg.chatId}
-      RESTART_MACHINE=${lib.escapeShellArg cfg.restart.machine}
-      RESTART_UNIT=${lib.escapeShellArg cfg.restart.unit}
+      RUN_USER=${lib.escapeShellArg cfg.user}
+      T3_ENTRY=${lib.escapeShellArg cfg.t3Entry}
+      # The t3 data directory (the parent of userdata/, which holds the DB).
+      BASE_DIR=$(dirname "$(dirname "$DB")")
+      TTL=${lib.escapeShellArg cfg.ttl}
+      LABEL=${lib.escapeShellArg cfg.label}
       THROTTLE=${toString cfg.throttleSeconds}
       STATE_DIR=/var/lib/t3-pair-notify
       STAMP="$STATE_DIR/last-sent"
@@ -93,23 +99,32 @@ let
                    AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now');")
         [[ "''${n:-0}" -gt 0 ]]
       }
-      # Newest still-valid, unconsumed admin pairing credential (or empty).
-      valid_credential() {
-        sql "SELECT credential FROM auth_pairing_links
-             WHERE consumed_at IS NULL AND revoked_at IS NULL
-               AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now')
-             ORDER BY created_at DESC LIMIT 1;"
-      }
-      # Newest credential of any state — used to detect a re-mint after restart.
-      latest_credential() {
-        sql "SELECT credential FROM auth_pairing_links
-             ORDER BY created_at DESC LIMIT 1;"
+      # Mint a fresh link. `auth pairing create` writes straight to the user's
+      # sqlite store, so it runs as that user: a root-created WAL/journal file
+      # alongside the DB would break the server's own writes. It builds the URL
+      # against the TAILNET host, because t3's own connection string uses the
+      # LAN IP, which is useless when you are remote.
+      #
+      # Everything after `runuser --` is an ABSOLUTE path, and the store is
+      # named with --base-dir rather than inherited from HOME. runuser resets
+      # PATH (and HOME) for the target user to the login defaults, which on
+      # NixOS resolve to nothing — so a bare `node`, or wrapping the call in
+      # `env`, fails with a bare "No such file or directory". That is invisible
+      # when testing from a login shell, where the caller's PATH happens to
+      # cover it, and only bites under the transient systemd unit that /t3pair
+      # launches.
+      mint_url() {
+        runuser -u "$RUN_USER" -- \
+          ${pkgs.nodejs_24}/bin/node "$T3_ENTRY" auth pairing create \
+            --base-dir "$BASE_DIR" \
+            --ttl "$TTL" --label "$LABEL" \
+            --base-url "$SCHEME://$HOST:$PORT" --json 2>/dev/null \
+          | jq -r '.pairUrl // empty'
       }
 
       send_link() {
-        local cred="$1" url
-        url="$SCHEME://$HOST:$PORT/pair#token=$cred"
-        send "$TO" "T3 Code pairing link (admin; valid ~5 min, single use):
+        local url="$1"
+        send "$TO" "T3 Code pairing link (valid $TTL, single use):
       $url
 
       Open it on a tailnet device to pair. Reply /t3pair for a fresh one."
@@ -134,41 +149,19 @@ let
         if throttled; then
           echo "t3-pair-notify: throttled (sent < ''${THROTTLE}s ago)" >&2; exit 0
         fi
-        # Server may still be coming up at boot; wait briefly for a valid link.
-        cred=""
-        for _ in $(seq 1 20); do
-          cred=$(valid_credential); [[ -n "$cred" ]] && break; sleep 3
-        done
-        if [[ -z "$cred" ]]; then
-          echo "t3-pair-notify: no valid pairing link yet; skipping (use /t3pair)" >&2
-          exit 0
-        fi
-        send_link "$cred"
-        exit 0
       fi
 
-      # --force: ensure a fresh, valid link exists, restarting t3-serve to re-mint
-      # if the latest one is stale or already consumed.
-      cred=$(valid_credential)
-      if [[ -z "$cred" ]]; then
-        before=$(latest_credential)
-        echo "t3-pair-notify: no valid link; restarting $RESTART_UNIT to re-mint" >&2
-        systemctl --machine="$RESTART_MACHINE" --user restart "$RESTART_UNIT" \
-          >/dev/null 2>&1 || echo "t3-pair-notify: restart command failed" >&2
-        # Server takes ~25-30s to listen and mint; poll for a credential change.
-        for _ in $(seq 1 30); do
-          cur=$(valid_credential)
-          if [[ -n "$cur" && "$cur" != "$before" ]]; then cred="$cur"; break; fi
-          sleep 3
-        done
-      fi
-      if [[ -z "$cred" ]]; then
-        send "$TO" "❌ Couldn't mint a T3 pairing link — is t3-serve healthy? \
+      # Both modes mint the same way. Minting does not require the server to be
+      # running, so the boot prompt does not have to wait for `t3-serve` to come
+      # up — the link stays valid for its whole TTL either way.
+      url=$(mint_url || true)
+      if [[ -z "$url" ]]; then
+        send "$TO" "❌ Couldn't mint a T3 pairing link — is the t3 install intact? \
       Check: systemctl --user status t3-serve"
-        echo "t3-pair-notify: failed to obtain a pairing link after restart" >&2
+        echo "t3-pair-notify: 'auth pairing create' produced no pairUrl" >&2
         exit 1
       fi
-      send_link "$cred"
+      send_link "$url"
     '';
   };
 in
@@ -221,20 +214,49 @@ in
       };
     };
 
-    restart = {
-      machine = lib.mkOption {
-        type = lib.types.str;
-        example = "elijah@.host";
-        description = ''
-          systemd --machine target for the user running t3-serve, so this root
-          helper can restart the user unit (`systemctl --machine=<m> --user`).
-        '';
-      };
-      unit = lib.mkOption {
-        type = lib.types.str;
-        default = "t3-serve.service";
-        description = "The user systemd unit to restart on a forced re-mint.";
-      };
+    user = lib.mkOption {
+      type = lib.types.str;
+      example = "elijah";
+      description = ''
+        The user that runs `t3-serve` and owns the t3 store. Minting drops to
+        this user so the sqlite files keep their ownership.
+      '';
+    };
+
+    userHome = lib.mkOption {
+      type = lib.types.str;
+      default = "/home/${cfg.user}";
+      defaultText = lib.literalExpression ''"/home/''${config.services.t3PairNotify.user}"'';
+      description = "Home directory of `user`; only used to derive `t3Entry`.";
+    };
+
+    t3Entry = lib.mkOption {
+      type = lib.types.str;
+      default = "${cfg.userHome}/.local/state/t3-serve/node_modules/t3/dist/bin.mjs";
+      defaultText = lib.literalExpression ''"''${userHome}/.local/state/t3-serve/node_modules/t3/dist/bin.mjs"'';
+      description = ''
+        Path to the t3 CLI entrypoint. Defaults to the install tree that
+        services.t3Serve (modules/home/t3-serve.nix) maintains.
+      '';
+    };
+
+    ttl = lib.mkOption {
+      type = lib.types.str;
+      default = "1h";
+      example = "30d";
+      description = ''
+        Lifetime of a minted link, as `t3 auth pairing create --ttl` accepts it
+        (`5m`, `1h`, `30d`, ...). This is how long the UNREDEEMED coupon stays
+        usable; the session it grants outlives it. Kept short by default because
+        the link is delivered over Telegram and grants code execution — long
+        TTLs leave a live credential sitting in a chat log.
+      '';
+    };
+
+    label = lib.mkOption {
+      type = lib.types.str;
+      default = "telegram";
+      description = "Label recorded on the grant, so `auth pairing list` is legible.";
     };
 
     throttleSeconds = lib.mkOption {

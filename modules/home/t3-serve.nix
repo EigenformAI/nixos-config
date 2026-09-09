@@ -11,6 +11,11 @@
 # host must therefore enable lingering for the user (see modules/common/users.nix)
 # so the service starts at boot and survives logout.
 #
+# t3 is distributed on npm, so the unit installs a pinned version into
+# ~/.local/state/t3-serve on first start and execs it directly. It deliberately
+# does not use `npx`: see the comments in the wrapper below for the two ways
+# that hidden cache took the server down silently.
+#
 # One-time setup (none of this is expressible in Nix — it's tailnet/host state):
 #   1. Admin console: enable HTTPS certificates for the tailnet
 #      (https://login.tailscale.com/admin/dns -> "Enable HTTPS").
@@ -47,13 +52,65 @@ let
 
   t3Wrapper = pkgs.writeShellApplication {
     name = "t3-serve-wrapper";
-    runtimeInputs = [ pkgs.nodejs_24 pkgs.bun ] ++ lib.optional cfg.useTailscaleServe pkgs.tailscale;
+    runtimeInputs = [
+      pkgs.nodejs_24
+      pkgs.bun
+      # node-pty (a t3 dependency) publishes prebuilt binaries for darwin and
+      # win32 only. On linux-x64 it must be compiled from source, which needs a
+      # C++ toolchain and Python on PATH.
+      pkgs.node-gyp
+      pkgs.gnumake
+      pkgs.gcc
+      pkgs.python3
+    ] ++ lib.optional cfg.useTailscaleServe pkgs.tailscale;
     text = ''
       export NPM_CONFIG_YES=true
       export NPM_CONFIG_LOGLEVEL=warn
-      # Pre-warm the npx cache so the first real run doesn't hang on download.
-      npx -y t3@${cfg.t3Version} --version >/dev/null 2>&1 || true
-      exec npx -y t3@${cfg.t3Version} ${argString}
+
+      # Install into a directory this module owns rather than letting `npx`
+      # manage a hidden tree under ~/.npm/_npx/<hash>. That cache turned out to
+      # be the weakest link in the whole service:
+      #   - It is written non-atomically. A power cut mid-install (this host
+      #     power-cycles itself to recover a wedged GPU) leaves zero-length
+      #     files behind. node runs an empty entrypoint as a successful no-op,
+      #     so the unit exits 0 — indistinguishable from a clean stop, and
+      #     `Restart=on-failure` therefore never fires.
+      #   - Every `npx` invocation takes a `concurrency.lock` in that directory.
+      #     A lock left behind by a killed process blocks the next start
+      #     indefinitely, while systemd still reports the unit as active.
+      # A plain prefix install is inspectable, verifiable and repairable.
+      PREFIX="$HOME/.local/state/t3-serve"
+      ENTRY="$PREFIX/node_modules/t3/dist/bin.mjs"
+      PTY="$PREFIX/node_modules/node-pty/build/Release/pty.node"
+      STAMP="$PREFIX/.installed-version"
+      WANT=${lib.escapeShellArg cfg.t3Version}
+
+      install_t3() {
+        echo "t3-serve: installing t3@$WANT into $PREFIX"
+        rm -rf "$PREFIX"
+        mkdir -p "$PREFIX"
+        npm install --prefix "$PREFIX" --no-audit --no-fund "t3@$WANT"
+        # node-pty's own `install` script swallows a failed source build, and
+        # the damage only surfaces much later as a NodePtyModuleLoadError when
+        # the server starts. Build it here, where a failure fails the unit.
+        ( cd "$PREFIX/node_modules/node-pty" \
+            && node-gyp rebuild --nodedir=${pkgs.nodejs_24} )
+        printf '%s' "$WANT" > "$STAMP"
+      }
+
+      # Reinstall when the tree is missing, truncated, or the wrong version.
+      # `-s` (non-empty) rather than `-e` is the point: it is exactly the
+      # zero-length-after-crash case that a plain existence check misses.
+      HAVE=$(cat "$STAMP" 2>/dev/null || true)
+      if [ ! -s "$ENTRY" ] || [ ! -s "$PTY" ] || [ "$HAVE" != "$WANT" ]; then
+        install_t3
+      fi
+
+      # Run the entrypoint directly. Going through `npx`/`npm exec` would
+      # re-resolve the package against the registry on every start, take the
+      # lock described above, and add a process layer that has to be killed
+      # twice to stop the server.
+      exec node "$ENTRY" ${argString}
     '';
   };
 in
@@ -90,10 +147,13 @@ in
 
     t3Version = lib.mkOption {
       type = lib.types.str;
-      default = "latest";
+      default = "0.0.33";
       description = ''
-        npm tag or version of `t3` to run via `npx`. Pin to a specific version
-        once you have a known-good build to avoid alpha churn.
+        npm version of `t3` to install and run. Keep this pinned to a known-good
+        release: t3 publishes alpha builds frequently, and a bad one picked up
+        automatically takes remote access to this host down at exactly the
+        moment you are not sitting in front of it. Changing this value triggers
+        a reinstall on the next unit start.
       '';
     };
   };
@@ -105,12 +165,21 @@ in
         Documentation = [ "https://github.com/pingdotgg/t3code/blob/main/REMOTE.md" ];
         Wants = [ "network-online.target" ];
         After = [ "network-online.target" ];
+        # Paired with Restart=always below: retry a genuinely broken install a
+        # few times, then stop and stay stopped rather than reinstalling t3 in
+        # a tight loop.
+        StartLimitIntervalSec = 300;
+        StartLimitBurst = 5;
       };
 
       Service = {
         Type = "simple";
         ExecStart = "${t3Wrapper}/bin/t3-serve-wrapper";
-        Restart = "on-failure";
+        # `always`, not `on-failure`. For a server, exiting 0 is still an
+        # outage — and it is the exact shape the corrupted-install bug took:
+        # node ran a zero-length entrypoint, exited 0, and on-failure sat there
+        # while the host went unreachable.
+        Restart = "always";
         RestartSec = 5;
         WorkingDirectory = "%h";
         Environment = [

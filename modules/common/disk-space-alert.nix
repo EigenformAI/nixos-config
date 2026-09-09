@@ -9,19 +9,15 @@
 # new getUpdates consumer.
 #
 # Alerting is EDGE-TRIGGERED, not level-triggered, so it never spams:
-#   - fire once when a mount first crosses cfg.thresholdPercent;
-#   - stay quiet while it hovers, re-firing only if it climbs another
-#     cfg.reAlertStepPercent points (escalation) since the last alert;
-#   - send a one-shot "recovered" note when it drops back below threshold.
-# Per-mount state (last-alerted percent, or "ok") lives in
+#   - fire once when a mount crosses each configured threshold;
+#   - stay quiet while it hovers within the same threshold band;
+#   - send a one-shot "recovered" note when it drops below all thresholds.
+# Per-mount state (highest crossed threshold, or "ok") lives in
 # /var/lib/disk-space-alert; alerting is best-effort and never fails the unit.
 #
-# Design note (percent-only): a single percentage threshold is used rather
-# than an absolute-free-bytes floor. On this host's mounts (448G–1.9T) 90%
-# leaves 45–190G, which is a reasonable "act now" line across all of them, and
-# one knob keeps the module simple. If a huge mount ever needs a tighter
-# absolute floor, add a `minFreeGib` OR-trigger — deliberately deferred as
-# YAGNI for now.
+# Design note (percent-only): percentage thresholds are used rather than an
+# absolute-free-bytes floor. If a huge mount ever needs a tighter absolute
+# floor, add a `minFreeGib` OR-trigger — deliberately deferred as YAGNI for now.
 { config, lib, pkgs, ... }:
 let
   cfg = config.services.diskSpaceAlert;
@@ -32,8 +28,7 @@ let
     name = "disk-space-alert-check";
     runtimeInputs = [ pkgs.coreutils pkgs.gawk ];
     text = ''
-      threshold=${toString cfg.thresholdPercent}
-      step=${toString cfg.reAlertStepPercent}
+      thresholds=( ${lib.concatMapStringsSep " " toString cfg.thresholdsPercent} )
       host=${lib.escapeShellArg config.networking.hostName}
       state_dir=/var/lib/disk-space-alert
       mkdir -p "$state_dir"
@@ -59,12 +54,18 @@ let
         prev=ok
         [[ -f "$statefile" ]] && prev=$(cat "$statefile")
 
-        if (( use >= threshold )); then
-          # New crossing, or escalated by >= step since the last alert.
-          if [[ "$prev" == "ok" ]] || (( use >= 10#$prev + step )); then
-            warn+="• $mount: ''${use}% used (''${avail_h} free of ''${size_h})"$'\n'
-            echo "$use" > "$statefile"
+        crossed=ok
+        for threshold in "''${thresholds[@]}"; do
+          (( use >= threshold )) && crossed=$threshold
+        done
+
+        if [[ "$crossed" != "ok" ]]; then
+          if [[ "$prev" == "ok" ]] || (( crossed > 10#$prev )); then
+            warn+="• $mount: ''${use}% used (crossed ''${crossed}%; ''${avail_h} free of ''${size_h})"$'\n'
           fi
+          # Track downward movement too, so crossing a higher threshold again
+          # after dropping below it produces a fresh alert.
+          [[ "$prev" == "$crossed" ]] || echo "$crossed" > "$statefile"
         else
           if [[ "$prev" != "ok" ]]; then
             recovered+="• $mount: back to ''${use}% used (''${avail_h} free)"$'\n'
@@ -74,7 +75,7 @@ let
       done
 
       msg=""
-      [[ -n "$warn" ]] && msg+="⚠️ $host disk space warning (≥''${threshold}% full):"$'\n'"$warn"
+      [[ -n "$warn" ]] && msg+="⚠️ $host disk space warning:"$'\n'"$warn"
       [[ -n "$recovered" ]] && { [[ -n "$msg" ]] && msg+=$'\n'; msg+="✅ $host disk space recovered:"$'\n'"$recovered"; }
 
       if [[ -n "$msg" ]]; then
@@ -94,19 +95,13 @@ in
       description = "Mountpoints to monitor. Missing mounts (nofail) are skipped.";
     };
 
-    thresholdPercent = lib.mkOption {
-      type = lib.types.ints.between 1 100;
-      default = 90;
-      description = "Warn when a monitored mount is at or above this % full.";
-    };
-
-    reAlertStepPercent = lib.mkOption {
-      type = lib.types.ints.positive;
-      default = 5;
+    thresholdsPercent = lib.mkOption {
+      type = lib.types.nonEmptyListOf (lib.types.ints.between 1 100);
+      default = [ 95 99 ];
+      apply = thresholds: lib.sort builtins.lessThan (lib.unique thresholds);
       description = ''
-        Once a mount has alerted, only re-alert if it climbs at least this many
-        percentage points further (escalation). Prevents per-interval spam
-        while a mount hovers just over the threshold.
+        Usage percentages at which to alert. Each threshold crossing alerts
+        once; dropping below a threshold rearms it.
       '';
     };
 
