@@ -41,7 +41,7 @@ let
 
   notifyScript = pkgs.writeShellApplication {
     name = "t3-pair-notify";
-    runtimeInputs = with pkgs; [ curl jq coreutils sqlite util-linux nodejs_24 ];
+    runtimeInputs = with pkgs; [ curl jq coreutils sqlite util-linux ];
     text = ''
       TOKEN_FILE=${lib.escapeShellArg cfg.botTokenFile}
       DB=${lib.escapeShellArg cfg.dbPath}
@@ -50,7 +50,6 @@ let
       PORT=${toString cfg.pairUrl.port}
       DEFAULT_CHAT=${toString cfg.chatId}
       RUN_USER=${lib.escapeShellArg cfg.user}
-      T3_ENTRY=${lib.escapeShellArg cfg.t3Entry}
       # The t3 data directory (the parent of userdata/, which holds the DB).
       BASE_DIR=$(dirname "$(dirname "$DB")")
       TTL=${lib.escapeShellArg cfg.ttl}
@@ -108,14 +107,14 @@ let
       # Everything after `runuser --` is an ABSOLUTE path, and the store is
       # named with --base-dir rather than inherited from HOME. runuser resets
       # PATH (and HOME) for the target user to the login defaults, which on
-      # NixOS resolve to nothing — so a bare `node`, or wrapping the call in
+      # NixOS resolve to nothing — so a bare `t3`, or wrapping the call in
       # `env`, fails with a bare "No such file or directory". That is invisible
       # when testing from a login shell, where the caller's PATH happens to
       # cover it, and only bites under the transient systemd unit that /t3pair
       # launches.
       mint_url() {
         runuser -u "$RUN_USER" -- \
-          ${pkgs.nodejs_24}/bin/node "$T3_ENTRY" auth pairing create \
+          ${lib.getExe cfg.package} auth pairing create \
             --base-dir "$BASE_DIR" \
             --ttl "$TTL" --label "$LABEL" \
             --base-url "$SCHEME://$HOST:$PORT" --json 2>/dev/null \
@@ -223,21 +222,8 @@ in
       '';
     };
 
-    userHome = lib.mkOption {
-      type = lib.types.str;
-      default = "/home/${cfg.user}";
-      defaultText = lib.literalExpression ''"/home/''${config.services.t3PairNotify.user}"'';
-      description = "Home directory of `user`; only used to derive `t3Entry`.";
-    };
-
-    t3Entry = lib.mkOption {
-      type = lib.types.str;
-      default = "${cfg.userHome}/.local/state/t3-serve/node_modules/t3/dist/bin.mjs";
-      defaultText = lib.literalExpression ''"''${userHome}/.local/state/t3-serve/node_modules/t3/dist/bin.mjs"'';
-      description = ''
-        Path to the t3 CLI entrypoint. Defaults to the install tree that
-        services.t3Serve (modules/home/t3-serve.nix) maintains.
-      '';
+    package = lib.mkPackageOption pkgs "t3code" {
+      extraDescription = "Use the same package as services.t3Serve.package.";
     };
 
     ttl = lib.mkOption {

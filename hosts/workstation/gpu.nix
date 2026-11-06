@@ -1,8 +1,18 @@
 # NVIDIA GPU configuration for 2x RTX 4090.
 # Proprietary drivers + CUDA toolkit + container toolkit for Docker GPU passthrough.
-{ config, pkgs, lib, ... }:
+{ config, pkgs, lib, nixpkgs-gpu, ... }:
+
+let
+  gpuPkgs = import nixpkgs-gpu {
+    system = pkgs.stdenv.hostPlatform.system;
+    config.allowUnfree = true;
+  };
+in
 
 {
+  # Stay on 6.18 LTS while updating the kernel and NVIDIA driver together.
+  boot.kernelPackages = gpuPkgs.linuxPackages_6_18;
+
   # NVIDIA proprietary drivers
   hardware.graphics = {
     enable = true;
@@ -10,7 +20,7 @@
   };
 
   hardware.nvidia = {
-    # Use the production driver branch (latest stable)
+    # Use the production driver from the explicitly pinned kernel package set.
     package = config.boot.kernelPackages.nvidiaPackages.production;
 
     # Modesetting is required for Wayland and most compositors
@@ -57,7 +67,7 @@
     cudatoolkit
     cudatoolkit.lib
     libglvnd
-    linuxPackages.nvidia_x11
+    config.hardware.nvidia.package
   ];
 
   # Kernel parameters for multi-GPU stability

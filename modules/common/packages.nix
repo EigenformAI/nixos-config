@@ -66,7 +66,6 @@ with pkgs; [
 
   # AI / LLM
   claude-code
-  codex
   ollama
   opencode
 

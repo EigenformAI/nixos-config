@@ -108,6 +108,7 @@ in
   # convenience layer, not the security boundary.
   services.t3PairNotify = {
     enable = true;
+    package = config.home-manager.users.elijah.services.t3Serve.package;
     chatId = 448383615;
     dbPath = "/home/elijah/.t3/userdata/state.sqlite";
     pairUrl = {

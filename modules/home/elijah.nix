@@ -11,7 +11,83 @@
 {
   imports = [
     ./nsl2-resume.nix
+    ./t3-serve.nix
+    ./rclone.nix
   ];
+
+  # ── rclone → Google Drive ──────────────────────────────────────────────
+  # Declarative `gdrive` remote + ad-hoc `gdrive-upload` helper. The 6-hourly
+  # geology-models backup that used to live here is DISABLED (obsolete — see the
+  # sync block). OAuth token/client_secret are installed by hand outside the Nix
+  # store — see the one-time bootstrap in modules/home/rclone.nix.
+  #
+  # Set clientId to your own OAuth client_id to avoid rclone's shared rate limit
+  # (leave "" to use rclone's built-in client). Personal-account OAuth.
+  services.gdrive = {
+    enable = true;
+    clientId = ""; # TODO: paste your Google OAuth client_id (not secret)
+    # Scheduled backup DROPPED 2026-07-16 — obsolete (the combo-geology models
+    # no longer need a Drive backup). The remote + `gdrive-upload` helper above
+    # stay available for ad-hoc pushes. Flip enable back to true to resume.
+    sync = {
+      enable = false;
+      source = "${config.home.homeDirectory}/combo-geology-nsl/NSL2-geology-task/models";
+      dest = "${config.services.gdrive.remoteName}:backups/combo-geology/models";
+      mode = "copy"; # additive — never deletes on Drive
+      onCalendar = "*-*-* 00/6:00:00"; # every 6 hours
+    };
+  };
+
+  # ── Second Drive account: elijah@eigenform.ai ──────────────────────────
+  # Work account, used for research-data archives. Declared directly through
+  # home-manager's remotes attrset rather than services.gdrive, which models a
+  # single remote; the secret-file convention is identical, so the same
+  # rclone-config.service renders both.
+  #
+  # This one has its own OAuth client (Desktop app), so it does NOT share the
+  # built-in client_id's global rate limit. client_id is not secret and lives
+  # here; client_secret and token are installed by hand, mode 600:
+  #
+  #   rclone authorize "drive" "<client_id>" "<client_secret>"   # browser machine
+  #   printf '%s' '<TOKEN_JSON>'     > ~/.config/rclone/secrets/eigenform-token
+  #   printf '%s' '<CLIENT_SECRET>'  > ~/.config/rclone/secrets/eigenform-client-secret
+  #   chmod 600 ~/.config/rclone/secrets/eigenform-*
+  #   systemctl --user restart rclone-config.service
+  #
+  # Adding a remote with `rclone config create` instead will NOT survive a
+  # nixos-rebuild — rclone-config.service rewrites rclone.conf from this file.
+  programs.rclone.remotes.gdrive-eigenform = {
+    config = {
+      type = "drive";
+      scope = "drive";
+      client_id = "355409719970-n6k1fju6s0kfnlff8j910fjgusp4sf4r.apps.googleusercontent.com";
+    };
+    secrets = {
+      token = "${config.xdg.configHome}/rclone/secrets/eigenform-token";
+      client_secret = "${config.xdg.configHome}/rclone/secrets/eigenform-client-secret";
+    };
+  };
+
+  # ── T3 Code remote agent server ────────────────────────────────────────
+  # Runs `t3 serve` as a user service so opencode/T3 Code can be driven
+  # remotely over the tailnet. Requires linger (set in modules/common/users.nix).
+  #
+  # Direct-bind mode (useTailscaleServe = false): binds 0.0.0.0:3773 and is
+  # reachable over the tailnet without TLS. This avoids the `--tailscale-serve`
+  # path, which needs HTTPS certs + Serve enabled in the Tailscale admin console.
+  # 3773 is not opened in remote-access.nix's firewall, and tailscale0 is a
+  # trusted interface, so the listener is effectively tailnet-only. Traffic is
+  # plaintext HTTP but still WireGuard-encrypted in transit by tailscale.
+  # Connect at http://limiting-factor.tail6ee1b.ts.net:3773
+  #
+  # To switch to the TLS endpoint later: enable HTTPS + Serve in the admin
+  # console, then set useTailscaleServe = true (see modules/home/t3-serve.nix).
+  services.t3Serve = {
+    enable = true;
+    useTailscaleServe = false;
+    host = "0.0.0.0";
+    port = 3773;
+  };
 
   home = {
     username = "elijah";
@@ -177,6 +253,17 @@
         bind -T copy-mode-vi TripleClick1Pane select-pane \; send-keys -X select-line \; send-keys -X copy-pipe-no-clear
         bind -n TripleClick1Pane select-pane \; copy-mode -M \; send-keys -X select-line \; send-keys -X copy-pipe-no-clear
         bind-key M-r run-shell "rm -rf $HOME/.cache/tmux/resurrect/*" \; display-message "Resurrect data cleared"
+
+        # ── Re-arm continuum auto-save (plugin load-order fix) ───────────────
+        # power-theme is sourced AFTER continuum in the merged plugin list and
+        # overwrites status-right, which silently drops continuum's periodic
+        # save hook  #(continuum_save.sh)  — so sessions were never saved and
+        # "restore on reboot" had nothing to restore. extraConfig is emitted
+        # after all plugins, so re-prepend ONLY the save interpolation onto the
+        # themed status-right (guarded against double-add). We deliberately do
+        # NOT re-source continuum wholesale, which would double-fire its
+        # restore-on-start; @continuum-restore itself is unaffected.
+        run-shell 'cur="$(tmux show -gqv status-right)"; case "$cur" in *continuum_save.sh*) ;; *) tmux set -g status-right "#(${pkgs.tmuxPlugins.continuum}/share/tmux-plugins/continuum/scripts/continuum_save.sh)$cur" ;; esac'
       '';
     };
 

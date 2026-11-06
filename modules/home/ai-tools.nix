@@ -9,7 +9,7 @@
 { config, pkgs, lib, ... }:
 
 {
-  home.activation.setupAITools = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
+  home.activation.setupAITools = lib.mkDefault (lib.hm.dag.entryAfter [ "writeBoundary" ] ''
     DOTFILES_AI="$HOME/dotfiles/ai-tools"
     REPO_AI="$(dirname "$(readlink -f "${toString ./ai-tools.nix}")")/ai-tools"
 
@@ -68,5 +68,5 @@
     resolve "shared/AI.md";              SHARED_AI="$SRC"
     resolve "claude-code/CLAUDE.md";     CC_CLAUDE="$SRC"
     concat_with_separator "$SHARED_AI" "$CC_CLAUDE" "$HOME/.claude/CLAUDE.md"
-  '';
+  '');
 }

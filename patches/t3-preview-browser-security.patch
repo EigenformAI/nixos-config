@@ -1,0 +1,22 @@
+diff --git a/apps/server/src/preview/PreviewBrowser.ts b/apps/server/src/preview/PreviewBrowser.ts
+--- a/apps/server/src/preview/PreviewBrowser.ts
++++ b/apps/server/src/preview/PreviewBrowser.ts
+@@ -80,6 +80,18 @@ const previewBrowserRelease = (
+   arch: NodeJS.Architecture,
+ ): PreviewBrowserRelease | null => {
+   const chrome = chromePlatform(platform, arch);
++  // This workstation's Linux x64 browser must include CVE-2026-118306's fix.
++  // Size and SHA-256 were verified against Google's Chrome for Testing archive.
++  if (chrome === "linux64") {
++    return {
++      version: "156.0.8078.79",
++      platform: chrome,
++      url: "https://storage.googleapis.com/chrome-for-testing-public/156.0.8078.79/linux64/chrome-headless-shell-linux64.zip",
++      bytes: 126_919_584,
++      sha256: "5435fce69cbe70b6b701e598b97bbe4f6f416d5058a3da0b5ad218930c08ba42",
++    };
++  }
++
+   return chrome === null
+     ? null
+     : {
